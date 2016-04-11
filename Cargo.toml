@@ -1,0 +1,10 @@
+[package]
+name = "webweaver"
+version = "0.1.0"
+authors = ["WaDelma <delma@del.ma>"]
+
+[dependencies]
+rand = "0.3.*"
+petgraph = "0.2.*"
+nalgebra = "0.6.*"
+num = "0.1.*"
