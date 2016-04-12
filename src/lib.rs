@@ -7,7 +7,7 @@ use std::ops::{Add, Sub, Mul, Div};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use rand::{Rng, Rand, SeedableRng};
+use rand::{Rng, Rand};
 
 use nalgebra::{BaseFloat, Norm, Cast};
 
@@ -30,26 +30,27 @@ impl<P, F> GraphLayout<P, F>
     where P: Zero + Norm<F> + Add<P, Output=P> + Sub<P, Output=P> + Mul<F, Output=P> + Div<F, Output=P> + Rand + Clone,
           F: BaseFloat,
 {
-    pub fn layout<N, E, SL, SP>(g: &Graph<N, E>, spring_length: SL, spring_position: SP) -> Self
-        where SL: Fn(NodeIndex, NodeIndex) -> F,
+    pub fn layout<N, E, I, SL, SP>(g: &Graph<N, E>, innitial: I, spring_length: SL, spring_position: SP) -> Self
+        where I: Fn(NodeIndex) -> P,
+              SL: Fn(NodeIndex, NodeIndex) -> F,
               SP: Fn(NodeIndex, NodeIndex) -> P,
     {
         let mut rand = rand::thread_rng();
         let mut layout = Self::new();
         let nodes = g.node_count();
-        let level = nodes;
-        let mut temperature: F = Cast::from(level as f64);
+        let level = 1.;
+        let mut temperature: F = Cast::from(level);
         let mut velocities = HashMap::new();
         let mut stabilised = false;
         for node in 0..nodes {
-            layout.0.insert(node, P::zero());
+            layout.0.insert(node, innitial(NodeIndex::new(node)));
             velocities.insert(node, P::zero());
         }
         while !stabilised {
             let mut flag = true;
             for n1 in 0..nodes {
                 let vec = layout.0.get(&n1).unwrap().clone();
-                let velocity = velocities.get(&n1).unwrap();
+                let velocity = velocities.get(&n1).unwrap().clone();
                 let mut acceleration = P::zero();
                 for n2 in 0..nodes {
                     if n1 == n2 {
@@ -59,12 +60,9 @@ impl<P, F> GraphLayout<P, F>
                     let diff = vec.clone() - cur_vec.clone();
                     let (unit, dist) = normalize_and_nudge(&mut rand, diff);
 
-                    let q1 = 0.0001;//0.0000000000000000001602;
-                    let q2 = 0.0001;//0.0000000000000000001602;
+                    let q1 = 0.0001;
+                    let q2 = 0.0001;
                     let force = (unit / dist.powi(2)) * Cast::from(q1 * q2) * Cast::from(ELECTRIC_FORCE_CONSTANT);
-
-                    // let mul: F = Cast::from(-0.2 * level as f64 * level as f64);
-                    // let force = unit * mul / dist;
 
                     acceleration = acceleration + force;
                 }
@@ -79,20 +77,19 @@ impl<P, F> GraphLayout<P, F>
                     debug_assert!(spring == spring_length(neighbor, n1));
 
                     let springyness: F = Cast::from(24.);
-                    let spring_length: F = Cast::from(1.);
-                    force = force * (-springyness * (spring_length - dist));
+                    force = force * (-springyness * (spring - dist));
                     let mut vel_diff = velocity.clone() - velocities.get(&neighbor.index()).unwrap().clone();
                     vel_diff = vel_diff * Cast::from(0.5);
                     let force = force - vel_diff;
 
-                    // force = force * dist.powi(2) / spring;
                     acceleration = acceleration + force;
                 }
-                let dist = acceleration.norm();
-                acceleration = acceleration.normalize();
-                acceleration = acceleration * temperature.min(dist);
-                *layout.0.get_mut(&n1.index()).unwrap() = vec + acceleration.clone();
-                if acceleration.norm() > Cast::from(level as f64 * 0.01) {
+                let velocity = velocity.clone() + acceleration;
+                let (velocity, dist) = normalize_and_nudge(&mut rand, velocity);
+                let velocity = velocity * temperature.min(dist);
+                velocities.insert(n1.index(), velocity.clone());
+                *layout.0.get_mut(&n1.index()).unwrap() = vec + velocity.clone();
+                if velocity.norm() > Cast::from(level * 0.01) {
                     flag = false;
                 }
             }
