@@ -6,6 +6,7 @@ extern crate vec_map;
 
 use std::ops::{Add, Sub, Mul, Div, IndexMut};
 use std::marker::PhantomData;
+use std::collections::HashMap;
 
 use vec_map::VecMap;
 
@@ -13,10 +14,11 @@ use rand::{Rng, Rand, SeedableRng};
 
 use nalgebra::{BaseFloat, Norm, Cast};
 
-use num::{Zero};
+use num::Zero;
 
 use petgraph::Graph;
 use petgraph::graph::{NodeIndex, IndexType};
+use petgraph::unionfind::UnionFind;
 
 const ELECTRIC_FORCE_CONSTANT: f64 = 8987551787.3681764;
 
@@ -39,80 +41,128 @@ impl<P, F> Layout<P, F>
     pub fn layout<N, E, SP>(g: &Graph<N, E>, spring_position: SP) -> Self
         where SP: Fn(NodeIndex, NodeIndex) -> P,
     {
-        let mut coarce_stack = Vec::with_capacity(g.node_count());
-        let mut cur = g.map(|_, _| (), |e, _| {
-            let (source, target) = g.edge_endpoints(e).expect("When mapping edges their source and target nodes should exist.");
-            (spring_position(source, target), spring_position(target, source))
-        });
-        while cur.edge_count() != 0 {
-            let mut next = Graph::with_capacity(cur.node_count(), cur.edge_count());
-            let mut mapping = VecMap::with_capacity(g.node_count());
-            for node in 0..cur.node_count() {
-                if mapping.contains_key(node) {
-                    continue;
-                }
-                let new_node = next.add_node(());
-                mapping.insert(node, new_node.index());
-                let mut neighbors = cur.neighbors_undirected(NodeIndex::new(node));
-                while let Some(neighbor) = neighbors.next() {
-                    if neighbor.index() == node {
-                        continue;
-                    }
-                    if !mapping.contains_key(neighbor.index()) {
-                        mapping.insert(neighbor.index(), new_node.index());
-                    }
-                    for n in neighbors.chain(cur.neighbors_undirected(neighbor)) {
-                        if neighbor == n || neighbor.index() == node || n.index() == node {
-                            continue;
-                        }
-                        if let Some(&v) = mapping.get(n.index()) {
-                            let edge = cur.find_edge_undirected(NodeIndex::new(node), n)
-                                .unwrap_or_else(|| cur.find_edge_undirected(neighbor, n)
-                                    .expect("If the edge wasn't one of nodes it should be it's neighbors edge.")).0;
-                            let edge = cur.edge_weight(edge).expect("There should be edge weight for all existing edges.");
-                            next.update_edge(new_node, NodeIndex::new(v), edge.clone());
-                        }
-                    }
-                    break;
+        let mut components = UnionFind::new(g.node_count());
+        for edge in g.raw_edges() {
+            let (a, b) = (edge.source(), edge.target());
+            components.union(a.index(), b.index());
+        }
+        let labeling = components.into_labeling();
+        let mut components = HashMap::with_capacity(labeling.len());
+        for (element, representative) in labeling.into_iter().enumerate() {
+            // TODO: Petgraph needs to be modified if one wants to preallocate these.
+            let &mut (ref mut graph, ref mut mapping, ref mut reverse_mapping) =
+                components.entry(representative)
+                    .or_insert_with(|| (Graph::new(), VecMap::new(), VecMap::new()));
+            let new = graph.add_node(());
+            mapping.insert(element, new.index());
+            reverse_mapping.insert(new.index(), element);
+            let mut neighbors = g.neighbors_undirected(NodeIndex::new(element));
+            while let Some(neighbor) = neighbors.next() {
+                if let Some(mapped) = mapping.get(neighbor.index()) {
+                    graph.update_edge(new, NodeIndex::new(*mapped), {
+                        let (source, target) = (NodeIndex::new(element), neighbor);
+                        (spring_position(source, target), spring_position(target, source))
+                    });
                 }
             }
-            // let name = format!("{}.dot", coarce_stack.len());
-            // let mut file = std::fs::File::create(name).unwrap();
-            // std::io::Write::write_all(&mut file, format!("{:?}", petgraph::dot::Dot::new(&cur)).as_bytes()).unwrap();
-            // debug_assert_eq!(cur.node_count(), petgraph::visit::BfsIter::new(&petgraph::visit::AsUndirected(&cur), NodeIndex::new(0)).count());
-            coarce_stack.push((cur, mapping));
-            cur = next;
         }
-        let mut layout = None;
-        while let Some((cur, mapping)) = coarce_stack.pop() {
-            layout = Some(Self::layout_level(&cur, coarce_stack.len() + 1, |i| {
-                if let Some(lay) = layout.as_ref() {
-                    let _: &Self = lay;
-                    let i = mapping.get(i.index()).expect("Each levels mappings should contain valid mapping from nodes to their parents.");
-                    lay.0.get(i.index()).expect("Latest layout should contain position of all nodes of that level.").clone()
-                } else {
-                    P::zero()
+        Layout(
+            components.into_iter()
+                .map(|(_, (graph, _, mapping))| {
+                    (Self::multilayout_connected_component(graph), mapping)
+                })
+                .flat_map(|(sub_layout, mapping)| {
+                    // TODO: Figure out connected components AABB and move them so they don't overlap.
+                    sub_layout.0
+                        .into_iter()
+                        .map(move |(k, v)| (mapping.get(k).expect("There should be mapping for each node.").clone(), v))
+                })
+                .collect(),
+            PhantomData
+        )
+    }
+
+    fn multilayout_connected_component(graph: Graph<(), (P, P)>) -> Layout<P, F> {
+        debug_assert_eq!(1, ::petgraph::algo::connected_components(&graph));
+        if graph.edge_count() == 0 {
+            let mut layout = Layout::with_capacity(1);
+            layout.0.insert(0, P::zero());
+            layout
+        } else {
+            let mut cur = graph;
+            let mut coarce_stack = Vec::with_capacity(cur.node_count());
+            while cur.edge_count() > 0 {
+                let mut next = Graph::with_capacity(cur.node_count(), cur.edge_count());
+                let mut mapping = VecMap::with_capacity(cur.node_count());
+                for node in 0..cur.node_count() {
+                    if mapping.contains_key(node) {
+                        continue;
+                    }
+                    let new_node = next.add_node(());
+                    mapping.insert(node, new_node.index());
+                    let mut neighbors = cur.neighbors_undirected(NodeIndex::new(node));
+                    while let Some(neighbor) = neighbors.next() {
+                        if neighbor.index() == node {
+                            continue;
+                        }
+                        if !mapping.contains_key(neighbor.index()) {
+                            mapping.insert(neighbor.index(), new_node.index());
+                        }
+                        for n in neighbors.chain(cur.neighbors_undirected(neighbor)) {
+                            if neighbor == n || neighbor.index() == node || n.index() == node {
+                                continue;
+                            }
+                            if let Some(&v) = mapping.get(n.index()) {
+                                let edge = cur.find_edge_undirected(NodeIndex::new(node), n)
+                                    .unwrap_or_else(|| cur.find_edge_undirected(neighbor, n)
+                                        .expect("If the edge wasn't one of nodes it should be it's neighbors edge.")).0;
+                                let edge = cur.edge_weight(edge).expect("There should be edge weight for all existing edges.");
+                                next.update_edge(new_node, NodeIndex::new(v), edge.clone());
+                            }
+                        }
+                        break;
+                    }
                 }
-            },
-            |_, _| Cast::from(1.), //TODO: Spring length from amount of nodes combined?
-            |from, to| {
-                let edge = cur.find_edge_undirected(from, to).expect("Layouting one level should give us valid nodes that form an edge.").0;
-                let edge = cur.edge_weight(edge).expect("There should be edge weight for all existing edges.");
-                if from.index() < to.index() {
-                    edge.0.clone()
-                } else {
-                    edge.1.clone()
-                }
-            }));
+                // let name = format!("{}.dot", coarce_stack.len());
+                // let mut file = std::fs::File::create(name).unwrap();
+                // std::io::Write::write_all(&mut file, format!("{:?}", petgraph::dot::Dot::new(&cur)).as_bytes()).unwrap();
+                debug_assert_eq!(1, ::petgraph::algo::connected_components(&cur));
+                coarce_stack.push((cur, mapping));
+                cur = next;
+            }
+            let mut layout = None;
+            while let Some((cur, mapping)) = coarce_stack.pop() {
+                layout = Some(Self::layout_level(&cur, coarce_stack.len() + 1, |i| {
+                    if let Some(lay) = layout.as_ref() {
+                        let _: &Self = lay;
+                        let i = mapping.get(i.index()).expect("Each levels mappings should contain valid mapping from nodes to their parents.");
+                        lay.0.get(i.index()).expect("Latest layout should contain position of all nodes of that level.").clone()
+                    } else {
+                        P::zero()
+                    }
+                },
+                |_, _| Cast::from(1.), //TODO: Spring length from amount of nodes combined?
+                |from, to| {
+                    let edge = cur.find_edge_undirected(from, to).expect("Layouting one level should give us valid nodes that form an edge.").0;
+                    let edge = cur.edge_weight(edge).expect("There should be edge weight for all existing edges.");
+                    if from.index() < to.index() {
+                        edge.0.clone()
+                    } else {
+                        edge.1.clone()
+                    }
+                }));
+            }
+            let mut layout = layout.expect("Coarcing should always contain atleast originals copy.");
+            layout.move_to_center();
+            layout
         }
-        layout.expect("Coarcing should always contain atleast originals copy.")
     }
 
     pub fn layout_fast<N, E>(g: &Graph<N, E>) -> Self {
         Self::layout_level(g, 1, |_| P::zero(), |_, _| Cast::from(1.), |_, _| P::zero())
     }
 
-    pub fn move_to_center(&mut self) {
+    fn move_to_center(&mut self) {
         let mut middle = P::zero();
         for n in self.0.values() {
             middle = middle + n.clone() / Cast::from(self.0.len() as f64);
@@ -173,6 +223,8 @@ impl<P, F> Layout<P, F>
                     let (mut force, dist) = normalize_and_nudge(&mut rand, diff);
                     let spring = spring_length(n1, neighbor);
                     debug_assert!(spring == spring_length(neighbor, n1));
+
+                    // TODO: Add torsion spring simulation to enforce wanted spring direction.
 
                     let springyness: F = Cast::from(24.);
                     force = force * (-springyness * (spring - dist));
