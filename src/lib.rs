@@ -38,7 +38,7 @@ impl<P, F> Layout<P, F>
     where P: Zero + IndexMut<usize, Output=F> + Norm<F> + Add<P, Output=P> + Sub<P, Output=P> + Mul<F, Output=P> + Div<F, Output=P> + Rand + Clone,
           F: BaseFloat,
 {
-    pub fn layout<N, E, SP>(g: &Graph<N, E>, spring_position: SP) -> Self
+    pub fn layout<N, E, SP>(g: &Graph<N, E>, edge_len: f64, spring_position: SP) -> Self
         where SP: Fn(NodeIndex, NodeIndex) -> P,
     {
         let mut components = UnionFind::new(g.node_count());
@@ -69,7 +69,7 @@ impl<P, F> Layout<P, F>
         Layout(
             components.into_iter()
                 .map(|(_, (graph, _, mapping))| {
-                    (Self::multilayout_connected_component(graph), mapping)
+                    (Self::multilayout_connected_component(graph, edge_len), mapping)
                 })
                 .flat_map(|(sub_layout, mapping)| {
                     // TODO: Figure out connected components AABB and move them so they don't overlap.
@@ -82,7 +82,7 @@ impl<P, F> Layout<P, F>
         )
     }
 
-    fn multilayout_connected_component(graph: Graph<(), (P, P)>) -> Layout<P, F> {
+    fn multilayout_connected_component(graph: Graph<(), (P, P)>, edge_len: f64) -> Layout<P, F> {
         debug_assert_eq!(1, ::petgraph::algo::connected_components(&graph));
         if graph.edge_count() == 0 {
             let mut layout = Layout::with_capacity(1);
@@ -141,7 +141,7 @@ impl<P, F> Layout<P, F>
                         P::zero()
                     }
                 },
-                |_, _| Cast::from(1.), //TODO: Spring length from amount of nodes combined?
+                |_, _| Cast::from(edge_len), //TODO: Spring length from amount of nodes combined?
                 |from, to| {
                     let edge = cur.find_edge_undirected(from, to).expect("Layouting one level should give us valid nodes that form an edge.").0;
                     let edge = cur.edge_weight(edge).expect("There should be edge weight for all existing edges.");
